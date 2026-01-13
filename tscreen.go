@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"os"
@@ -86,6 +87,8 @@ func NewTerminfoScreenFromTtyTerminfo(tty Tty, ti *terminfo.Terminfo) (s Screen,
 
 	t := &tScreen{ti: ti, tty: tty}
 
+	t.forceACS = os.Getenv("TCELL_FORCE_ACS") == "1"
+
 	if len(ti.Mouse) > 0 {
 		t.mouse = []byte(ti.Mouse)
 	}
@@ -134,6 +137,7 @@ type tScreen struct {
 	cursorx        int
 	cursory        int
 	acs            map[rune]string
+	forceACS       bool // if true, prefer ACS for line-drawing runes when available
 	charset        string
 	encoder        transform.Transformer
 	decoder        transform.Transformer
@@ -385,6 +389,22 @@ func (t *tScreen) SetStyle(style Style) {
 
 func (t *tScreen) encodeStr(s string) []byte {
 
+	// If requested, prefer ACS for line-drawing runes even when the encoder
+	// would successfully emit UTF-8. This is useful on TERM=linux (and
+	// tmux-on-console) where Unicode box drawing glyphs may be missing from
+	// the active font, causing them to render as "?" or blocks.
+	if t.forceACS {
+		r, _ := utf8.DecodeRuneInString(s)
+		if os.Getenv("TCELL_FORCE_ACS_DEBUG") == "1" {
+			fmt.Fprintf(os.Stderr, "endodeStr: rune=%U char=%q len(s)=%d bytes=% x\n", r, r, len(s), []byte(s))
+		}
+		if isLineRune(r) {
+			if acs, ok := t.acs[r]; ok {
+				return []byte(acs)
+			}
+		}
+	}
+
 	var dstBuf [128]byte
 	var buf []byte
 	nb := dstBuf[:]
@@ -411,6 +431,19 @@ func (t *tScreen) encodeStr(s string) []byte {
 	}
 
 	return buf
+}
+
+func isLineRune(r rune) bool {
+	switch r {
+	// NOTE: The Rune* constants are already defined as the corresponding
+	// light box-drawing glyphs (e.g. RuneHLine == '─'), so we must not list
+	// both or the switch will have duplicate cases.
+	case RuneHLine, RuneVLine, RuneULCorner, RuneURCorner, RuneLLCorner, RuneLRCorner,
+		'═', '║', '╔', '╗', '╚', '╝':
+		return true
+	default:
+		return false
+	}
 }
 
 func (t *tScreen) sendFgBg(fg Color, bg Color, attr AttrMask) AttrMask {
@@ -994,6 +1027,62 @@ func (t *tScreen) buildAcsMap() {
 		}
 		acsstr = acsstr[2:]
 	}
+	if t.forceACS {
+		t.addAcsAliases()
+	}
+}
+
+func (t *tScreen) addAcsAliases() {
+	// ACS only supports single-line box drawing. When forcing ACS, degrade
+	// Unicode double-line box characters (═║╔╗╚╝) to the single-line equivalents.
+	if t.acs == nil {
+		return
+	}
+
+	// Prefer semantic runes if present; otherwise fall back to light Unicode.
+	h := RuneHLine
+	v := RuneVLine
+	ul := RuneULCorner
+	ur := RuneURCorner
+	ll := RuneLLCorner
+	lr := RuneLRCorner
+	if _, ok := t.acs[h]; !ok {
+		h = '─'
+	}
+	if _, ok := t.acs[v]; !ok {
+		v = '│'
+	}
+	if _, ok := t.acs[ul]; !ok {
+		ul = '┌'
+	}
+	if _, ok := t.acs[ur]; !ok {
+		ur = '┐'
+	}
+	if _, ok := t.acs[ll]; !ok {
+		ll = '└'
+	}
+	if _, ok := t.acs[lr]; !ok {
+		lr = '┘'
+	}
+
+	if s, ok := t.acs[h]; ok {
+		t.acs['═'] = s
+	}
+	if s, ok := t.acs[v]; ok {
+		t.acs['║'] = s
+	}
+	if s, ok := t.acs[ul]; ok {
+		t.acs['╔'] = s
+	}
+	if s, ok := t.acs[ur]; ok {
+		t.acs['╗'] = s
+	}
+	if s, ok := t.acs[ll]; ok {
+		t.acs['╚'] = s
+	}
+	if s, ok := t.acs[lr]; ok {
+		t.acs['╝'] = s
+	}
 }
 
 func (t *tScreen) scanInput(buf *bytes.Buffer) {
@@ -1314,4 +1403,17 @@ func (t *tScreen) GetClipboard() {
 		t.TPuts(t.ti.TParm(t.setClipboard, "?"))
 	}
 	t.Unlock()
+}
+
+// SetForceACS forces ACS line drawing when available.
+// This overrides the environment variable TCELL_FORCE_ACS.
+func (t *tScreen) SetForceACS(enable bool) {
+	t.forceACS = enable
+	if enable {
+		t.addAcsAliases()
+	}
+}
+
+func (t *tScreen) ForceACS() bool {
+	return t.forceACS
 }
